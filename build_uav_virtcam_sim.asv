@@ -1,0 +1,382 @@
+% virtual_uav_color_pid.m
+% Virtual UAV with downward camera, color-based object detection, manual selection,
+% and PID control in inertial frame. No YOLO, no real camera.
+%
+% Run: open this file in MATLAB and press Run.
+% Click a detected yellow box in the camera pane to select the object to track.
+
+function virtual_uav_color_pid()
+clc; close all;
+
+%% ---------------- PARAMETERS ----------------
+dt        = 0.03;      % simulation timestep (s)
+simTime   = 40;        % seconds
+steps     = round(simTime / dt);
+
+% World (ENU) initial drone state
+dronePos = [0; 0; 6];  % X (east), Y (north), Z (up) in meters
+
+% Targets in world coordinates [X Y Z]
+targets = [ 5  5  0;
+            2  7  0;
+            7  2  0 ];
+targetRadius_m = 0.30; % real physical radius of circular target (meters) - used for depth estimate
+
+% Camera intrinsics (pinhole)
+imgW = 960; imgH = 720;            % camera resolution (px)
+fovV_deg = 60;                     % vertical field of view in degrees
+focalPx = (imgH/2)/tand(fovV_deg/2); % focal length in pixels (approx)
+
+% PID gains (tune these)
+Kp = 0.6; Ki = 0.02; Kd = 0.08;    % for XY (units: output m/s per meter error)
+% We'll do small-angle conversion for degrees outputs for display only.
+
+% velocity limits (m/s)
+vmax = 2.0;
+
+% drawing sizes (drone)
+dx = 0.5; dy = 0.5; dz = 0.2;
+
+%% ---------------- FIGURE / 3D SCENE SETUP ----------------
+set(0,'DefaultFigureRenderer','opengl');
+fig = figure('Name','Virtual UAV - Color Detection + PID','NumberTitle','off', ...
+    'Position',[50 50 1600 900],'Color',[0.06 0.06 0.08]);
+
+% 3D world axis (left)
+ax3 = axes('Parent',fig,'Position',[0.03 0.06 0.52 0.88]);
+hold(ax3,'on'); grid(ax3,'on'); axis(ax3,'equal');
+xlabel(ax3,'X (m)'); ylabel(ax3,'Y (m)'); zlabel(ax3,'Z (m)');
+xlim(ax3,[-2 10]); ylim(ax3,[-2 10]); zlim(ax3,[0 8]);
+title(ax3,'World (inertial ENU)','Color','w');
+ax3.Color = [0.05 0.05 0.07];
+
+% ground
+[Xg,Yg] = meshgrid(-10:1:12, -10:1:12);
+surf(ax3,Xg,Yg,zeros(size(Xg)),'FaceColor',[0.14 0.18 0.12],'EdgeColor','none');
+
+% drone (box)
+hDrone = drawBox(ax3, dronePos, dx, dy, dz, [0.0 0.5 1.0]);
+
+% targets: cylinders + colored disks (billboards)
+nTargets = size(targets,1);
+hTargets = gobjects(nTargets,1);
+hDisks = gobjects(nTargets,1);
+colors = lines(nTargets);
+for i=1:nTargets
+    hTargets(i) = drawCylinder(ax3, targets(i,:)+[0 0 targetRadius_m/2], targetRadius_m, targetRadius_m, colors(i,:));
+    hDisks(i) = drawDiskBillboard(ax3, targets(i,:), targetRadius_m, colors(i,:));
+end
+
+% right side: virtual camera feed
+axCam = axes('Parent',fig,'Position',[0.58 0.06 0.39 0.88]);
+hCam = imshow(zeros(imgH,imgW,3,'uint8'),'Parent',axCam);
+title(axCam,'Downward Virtual Camera','Color','w');
+axCam.Visible = 'off';
+
+drawnow;
+
+% storage for last detection results and selection
+lastBBoxes = zeros(0,4);
+lastCentroids = zeros(0,2);
+selectedIdx = [];  % index in lastBBoxes / targets chosen
+selectedTargetWorldIdx = [];  % which target index in world (1..nTargets)
+
+% For PID integration
+integralErr = [0;0];
+prevErr = [0;0];
+
+% Prepare a small UI text to instruct
+annotation('textbox',[0.58 0.90 0.39 0.06],'String','Click a yellow box in the camera feed to select target. Press Q to quit early.',...
+    'EdgeColor','none','Color','w','FontSize',11,'HorizontalAlignment','center');
+
+% Setup click callback on figure for manual selection
+set(fig,'WindowButtonDownFcn',@(src,evt) pickFromCam());
+
+%% ---------------- Simulation loop ----------------
+for step = 1:steps
+    % set camera pose: slightly below drone and looking straight down
+    camPos = dronePos + [0; 0; -0.1];        % a little below drone center
+    camTarget = dronePos + [0; 0; -1];       % point down
+    camUp = [0 1 0];                         % define up for the camera view
+    
+    % configure 3D view like a real camera pointing down
+    camva(ax3, fovV_deg);
+    campos(ax3, camPos');       % expects row vector
+    camtarget(ax3, camTarget');
+    camup(ax3, camUp);
+    
+    % render & grab figure frame robustly
+    drawnow limitrate;
+    frm = getframe(fig);
+    raw = frm.cdata;
+    
+    % crop to the ax3 region we want to simulate camera viewing (left area)
+    axPosPix = getpixelposition(ax3,true);  % [left bottom width height]
+    figPosPix = getpixelposition(fig,true);
+    % Convert axes position to image crop rectangle for imcrop
+    cropX = round(axPosPix(1));
+    cropY = round(figPosPix(4) - (axPosPix(2) + axPosPix(4))); % y from top
+    cropW = round(axPosPix(3));
+    cropH = round(axPosPix(4));
+    cropRect = [cropX cropY cropW cropH];
+    % Safety bounds
+    cropRect = max(cropRect,1);
+    try
+        camFull = imcrop(raw, cropRect);
+    catch
+        camFull = raw;
+    end
+    camFrame = imresize(camFull, [imgH imgW]);
+    
+    % ---------------- detection (color + blob) ----------------
+    % We rendered targets as colored disks (R,G,B from 'colors' lines).
+    % Let's detect the most saturated colored regions.
+    rgb = im2double(camFrame);
+    R = rgb(:,:,1); G = rgb(:,:,2); B = rgb(:,:,3);
+    % Simple color detection: find bright colored blobs (not background)
+    colorMask = (R+G+B) > 0.25 & (max(rgb,[],3) - min(rgb,[],3) ) > 0.08;
+    % Remove small noise
+    colorMask = imfill(colorMask,'holes');
+    colorMask = bwareaopen(colorMask, 80);
+    stats = regionprops(colorMask, 'BoundingBox', 'Centroid', 'Area');
+    if isempty(stats)
+        lastBBoxes = zeros(0,4);
+        lastCentroids = zeros(0,2);
+    else
+        lastBBoxes = vertcat(stats.BoundingBox);
+        lastCentroids = vertcat(stats.Centroid);
+    end
+    
+    % overlay boxes on camFrame for display
+    dispFrame = camFrame;
+    for b=1:size(lastBBoxes,1)
+        box = lastBBoxes(b,:);
+        dispFrame = insertShape(dispFrame,'Rectangle',box,'Color','yellow','LineWidth',3);
+    end
+    
+    % If user hasn't selected yet, highlight best candidate automatically
+    if isempty(selectedIdx) && ~isempty(lastBBoxes)
+        % choose largest area blob center (closest/largest)
+        areas = [stats.Area]';
+        [~,idmax] = max(areas);
+        selectedIdx = idmax;
+        % Map selection to nearest world target index (by screen centroid)
+        if ~isempty(lastCentroids)
+            centers = lastCentroids;
+            % compute world-projected centroid positions to compare:
+            % We rendered the targets with known order; find nearest target by uv
+            % We'll compute target uv from known world targets
+            uvTargets = worldToImageAll(targets, dronePos, fovV_deg, imgW, imgH, focalPx);
+            % choose nearest target that is not NaN
+            valid = ~any(isnan(uvTargets),2);
+            if any(valid)
+                dists = sum((uvTargets(valid,:)-centers(selectedIdx,:)).^2,2);
+                idxs = find(valid);
+                [~,mmin] = min(dists);
+                selectedTargetWorldIdx = idxs(mmin);
+            else
+                selectedTargetWorldIdx = 1;
+            end
+        else
+            selectedTargetWorldIdx = 1;
+        end
+    end
+    
+    % If user selected, draw green thick box on that selection
+    if ~isempty(selectedIdx) && selectedIdx <= size(lastBBoxes,1)
+        dispFrame = insertShape(dispFrame,'Rectangle',lastBBoxes(selectedIdx,:),'Color','green','LineWidth',5);
+    end
+    
+    % show camera feed
+    set(hCam,'CData',dispFrame);
+    drawnow limitrate;
+    
+    % ---------------- compute pixel->meter offsets ----------------
+    if ~isempty(selectedIdx) && selectedIdx <= size(lastBBoxes,1)
+        box = lastBBoxes(selectedIdx,:);
+        u = box(1) + box(3)/2;   % px
+        v = box(2) + box(4)/2;   % px
+        % estimate pixel radius from bbox width
+        r_pix = max(box(3), box(4))/2;
+        % Depth estimate using pinhole: Z = (real_radius * focalPx) / r_pix
+        Z_est = (targetRadius_m * focalPx) / max(r_pix,1e-3);  % meters
+        % Convert pixel offset to meters in camera frame:
+        u0 = imgW/2; v0 = imgH/2;
+        x_cam_m = (u - u0) * Z_est / focalPx;   % +x to right (east)
+        y_cam_m = (v - v0) * Z_est / focalPx;   % +y down (north)
+        % Our camera is pointing down; in world ENU with camera aligned (no rotation)
+        % convert to world X,Y displacements: camera right -> world +X east, down -> world +Y north
+        error_world = [x_cam_m; y_cam_m];  % meters
+    else
+        error_world = [0;0];
+        Z_est = NaN;
+    end
+    
+    % ---------------- PID control (velocity command) ----------------
+    if ~isempty(selectedIdx)
+        err = error_world; % want to drive to zero
+        integralErr = integralErr + err * dt;
+        derivative = (err - prevErr) / dt;
+        pid_out = Kp * err + Ki * integralErr + Kd * derivative; % units: m/s approx
+        prevErr = err;
+    else
+        pid_out = [0;0];
+    end
+    % saturate
+    vx = max(-vmax,min(vmax, -pid_out(1))); % negative so positive error moves drone toward object
+    vy = max(-vmax,min(vmax, -pid_out(2)));
+    vz = 0;  % keep altitude fixed for now
+    
+    % integrate drone position (simple Euler)
+    dronePos = dronePos + [vx; vy; vz] * dt;
+    % keep altitude constant (could integrate vz if you want)
+    dronePos(3) = dronePos(3);
+    
+    % update 3D drone representation
+    updateBox(hDrone, dronePos, dx,dy,dz);
+    
+    % update target/ disk positions (static in this example)
+    for i=1:nTargets
+        % nothing moving for now; if you move targets, add here
+    end
+    
+    % draw helper: center-to-object line and triangle overlay on camFrame display
+    if ~isempty(selectedIdx) && selectedIdx <= size(lastBBoxes,1)
+        % draw center cross and line
+        u0 = imgW/2; v0 = imgH/2;
+        u = lastCentroids(selectedIdx,1); v = lastCentroids(selectedIdx,2);
+        % draw a line on dispFrame
+        numPts = max(3,round(hypot(u-u0,v-v0)));
+        for k=0:numPts
+            xk = round(u0 + (u - u0) * (k/numPts));
+            yk = round(v0 + (v - v0) * (k/numPts));
+            if xk>=1 && xk<=imgW && yk>=1 && yk<=imgH
+                dispFrame(yk,xk,:) = uint8([255 255 0]);
+            end
+        end
+        % show x and y legs as blue and red lines
+        for xk = round(min(u0,u)):round(max(u0,u))
+            yk = round(v0);
+            if xk>=1 && xk<=imgW && yk>=1 && yk<=imgH
+                dispFrame(yk,xk,:) = uint8([0 120 255]); % horizontal leg
+            end
+        end
+        for yk = round(min(v0,v)):round(max(v0,v))
+            xk = round(u);
+            if xk>=1 && xk<=imgW && yk>=1 && yk<=imgH
+                dispFrame(yk,xk,:) = uint8([255 50 50]); % vertical leg
+            end
+        end
+        set(hCam,'CData',dispFrame);
+    end
+    
+    % ---------------- terminal output ----------------
+    if ~isempty(selectedIdx)
+        % small-angle deg proxies
+        pitch_deg = atan2d(error_world(2), dronePos(3));  % pitch ~ vertical component
+        roll_deg  = atan2d(error_world(1), dronePos(3));  % roll ~ horizontal component
+        dist_mag = hypot(error_world(1), error_world(2));
+        fprintf('Step %03d | Pitch: %6.2f° | Roll: %6.2f° | Alt: %5.2f m | Dist: %6.3f m | PID vx: %5.3f m/s vy: %5.3f m/s | Zest: %5.3f m\n', ...
+            step, pitch_deg, roll_deg, dronePos(3), dist_mag, vx, vy, Z_est);
+    else
+        fprintf('Step %03d | No target selected. DronePos: (%.2f, %.2f, %.2f)\n', step, dronePos(1), dronePos(2), dronePos(3));
+    end
+    
+    % check for quit key 'q'
+    drawnow;
+    if ~ishandle(fig), break; end
+    key = get(fig,'CurrentCharacter');
+    if ~isempty(key) && (key == 'q' || key == 'Q'), break; end
+end
+
+disp('Simulation finished.');
+
+%% -------------- Nested helper: click selection ----------------
+    function pickFromCam()
+        % Map click coordinates into image pixel coords of axCam
+        cp = get(axCam,'CurrentPoint'); % x,y in image coordinates
+        xClick = cp(1,1); yClick = cp(1,2);
+        if isempty(lastBBoxes), return; end
+        % find bbox that contains click (or nearest center)
+        idx = [];
+        for ii=1:size(lastBBoxes,1)
+            bb = lastBBoxes(ii,:);
+            if xClick >= bb(1) && xClick <= bb(1)+bb(3) && yClick >= bb(2) && yClick <= bb(2)+bb(4)
+                idx = ii; break;
+            end
+        end
+        if isempty(idx)
+            % nearest center
+            centers = lastCentroids;
+            dists = hypot(centers(:,1)-xClick, centers(:,2)-yClick);
+            [~,idx] = min(dists);
+        end
+        if ~isempty(idx)
+            selectedIdx = idx;
+            % map to world target: nearest world target projection
+            uvTargets = worldToImageAll(targets, dronePos, fovV_deg, imgW, imgH, focalPx);
+            % compute distances
+            if ~isempty(uvTargets)
+                d2 = sum((uvTargets - lastCentroids(idx,:)).^2,2,'omitnan');
+                [~,mmin] = min(d2);
+                selectedTargetWorldIdx = mmin;
+            else
+                selectedTargetWorldIdx = [];
+            end
+            fprintf('User selected bbox %d -> world target idx %d\n', selectedIdx, selectedTargetWorldIdx);
+        end
+    end
+
+end  % main function
+
+%% ------------------ utility functions ------------------
+function uv = worldToImageAll(worldPts, dronePos, fovV_deg, imgW, imgH, focalPx)
+% projects worldPts (Nx3) into camera image given camera is aligned downwards at dronePos
+% returns Nx2 pixel coordinates or NaN if behind camera
+R_world_from_cv = [1 0 0; 0 1 0; 0 0 -1];
+R_cv_from_world = R_world_from_cv';
+N = size(worldPts,1);
+uv = nan(N,2);
+for i=1:N
+    pw = worldPts(i,:);
+    pcv = (R_cv_from_world*(pw - dronePos)')';
+    if pcv(3) <= 0
+        uv(i,:) = [NaN NaN]; continue;
+    end
+    u = focalPx * (pcv(1)/pcv(3)) + imgW/2;
+    v = focalPx * (pcv(2)/pcv(3)) + imgH/2;
+    uv(i,:) = [u v];
+end
+end
+
+function h = drawBox(ax,pos,dx,dy,dz,color)
+[X,Y,Z] = ndgrid([-dx dx]/2,[-dy dy]/2,[-dz dz]/2);
+verts = [X(:) Y(:) Z(:)];
+faces = convhull(verts);
+h = patch(ax,'Vertices',verts + pos','Faces',faces,'FaceColor',color,'EdgeColor','none','FaceAlpha',0.9);
+end
+
+function updateBox(h,pos,dx,dy,dz)
+[X,Y,Z] = ndgrid([-dx dx]/2,[-dy dy]/2,[-dz dz]/2);
+verts = [X(:) Y(:) Z(:)];
+if isprop(h,'Vertices')
+    h.Vertices = verts + pos';
+end
+end
+
+function h = drawCylinder(ax, center, r, hgt, color)
+[th, z] = meshgrid(linspace(0,2*pi,36), linspace(0,hgt,2));
+X = center(1) + r*cos(th);
+Y = center(2) + r*sin(th);
+Z = center(3) + z - hgt/2;
+h = surf(ax, X, Y, Z, 'FaceColor', color, 'EdgeColor','none', 'FaceAlpha',1);
+end
+
+function h = drawDiskBillboard(ax, center, radius, color)
+% draw a flat disk (small elevation) facing up so it appears in camera view
+theta = linspace(0,2*pi,60);
+x = center(1) + radius*cos(theta);
+y = center(2) + radius*sin(theta);
+z = zeros(size(x)) + 0.01; % small lift to avoid z-fighting
+h = patch(ax, x, y, z, color, 'EdgeColor','none', 'FaceAlpha', 1);
+end

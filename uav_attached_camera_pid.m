@@ -1,0 +1,347 @@
+%% ===================== Drone + Virtual Downward Camera (3D) =====================
+% - Left: 3D world (drone + ground objects)
+% - Right: Live virtual camera feed (attached under the drone, looking down)
+% - Click a yellow detection in the camera feed to select the target
+% - PID drives the drone laterally and vertically to the object
+%
+% Requires: Computer Vision Toolbox
+%
+% Axes/Frames:
+%   Inertial/world frame:  X right, Y forward, Z up
+%   Camera frame (attached to drone bottom, looking down):
+%       z_cam = + forward along -Z_world (down)
+%       x_cam = + right  (aligned with +X_world)
+%       y_cam = + down   (aligned with +Y_world)
+%   Pinhole projection: u = fx * (x_cam / z_cam) + cx, v = fy * (y_cam / z_cam) + cy
+%
+% Units printed in terminal:
+%   PID_X [m/s], PID_Y [m/s], PID_Z [m/s], offsets [m], Zc [m], pos [m]
+
+clc; clear; close all;
+
+%% -------------------- Parameters --------------------
+dt       = 0.05;     % timestep [s]
+simTime  = 60;       % total time [s]
+time     = 0:dt:simTime;
+
+% Drone state (world frame)
+dronePos = [0, 0, 12];   % start above the field [m]
+droneVel = [0, 0, 0];
+
+% Camera (rigidly attached to drone, looking straight down)
+camOffset      = [0, 0, -0.5];   % camera underbody offset [m]
+imgWidth       = 960;
+imgHeight      = 960;
+fov_deg        = 70;              % vertical FOV [deg]
+fy             = (imgHeight/2) / tand(fov_deg/2);  % focal length [px]
+fx             = fy;                                % square pixels
+cx             = imgWidth/2;
+cy             = imgHeight/2;
+
+% Takeoff settings
+takeoffAlt = 15;   % target altitude [m]
+takeoffRate = 1.0; % climb speed [m/s]
+takeoffDone = false;
+
+% Objects on ground (each row = [X Y Z]), colored yellow in camera feed
+objsW = [ 6   8   0;
+        -10  -6   0;
+          4 -12   0;
+         -6   9   0 ];
+
+objRadius_m = 0.5;        % physical radius [m] (used only to size the blob in the camera)
+nObj        = size(objsW,1);
+
+% PID (independent on X,Y,Z in *world* frame)
+% PID gains
+Kp_xy = 1.2; Ki_xy = 0.05; Kd_xy = 0.4;   % lateral (X,Y) control
+Kp_z  = 2.0; Ki_z  = 0.001;  Kd_z  = 0.5;   % vertical (Z) control, stronger
+
+intErr = [0,0,0];  prevErr = [0,0,0];
+
+
+% Velocity limits (just to keep things sane)
+vmax_xy = 2.0;    % m/s
+vmax_z  = 2.0;    % m/s
+
+% Selection state
+selectedIdx   = [];     % index into objsW selected in the camera feed
+selectionMade = false;
+
+%% -------------------- Figure & UI --------------------
+fig = figure('Name','3D Drone + Virtual Camera','NumberTitle','off', ...
+             'Position',[80 80 1500 800],'Color',[0.06 0.11 0.09]);
+
+tlo = tiledlayout(fig,1,2,'TileSpacing','compact','Padding','compact');
+
+% 3D world
+ax3D = nexttile(tlo,1);
+hold(ax3D,'on'); grid(ax3D,'on'); axis(ax3D,'equal');
+xlabel(ax3D,'X (m)'); ylabel(ax3D,'Y (m)'); zlabel(ax3D,'Z (m)');
+xlim(ax3D,[-20 20]); ylim(ax3D,[-20 20]); zlim(ax3D,[0 15]);
+view(ax3D, 45, 25);
+title(ax3D,'3D World (drone + objects)');
+
+% Ground (simple patch)
+patch(ax3D,[-20 20 20 -20],[-20 -20 20 20],[0 0 0 0],[0.1 0.22 0.1], ...
+      'FaceAlpha',0.8,'EdgeColor','none');
+
+% Draw objects (as cylinders/disks)
+objSurf = gobjects(nObj,1);
+for i=1:nObj
+    objSurf(i) = drawDisk3D(ax3D, objsW(i,:), objRadius_m, [0.95 0.85 0.1]); % yellow
+    text(ax3D, objsW(i,1),objsW(i,2),objsW(i,3)+0.5, sprintf('Obj %d',i), ...
+        'Color',[1 1 1],'FontWeight','bold','FontSize',10,'HorizontalAlignment','center');
+end
+
+
+% Draw drone (blue box)
+boxDim = [0.6 0.6 0.25];
+hDrone = drawBox(ax3D, dronePos, boxDim, [0.2 0.5 1.0]);
+
+% Trajectory
+traj = dronePos; 
+trajPlot = plot3(ax3D,traj(:,1),traj(:,2),traj(:,3),'--','Color',[0.2 0.7 1 0.7],'LineWidth',1.2);
+
+% Camera feed (image)
+axCam = nexttile(tlo,2);
+camImg = zeros(imgHeight,imgWidth,3,'uint8');
+hCam  = imshow(camImg,'Parent',axCam);
+title(axCam,'Downward Virtual Camera (click a yellow detection to select target)');
+set(axCam,'YDir','normal');  % ensure v increases downward visually
+
+% Mouse click to select a detection
+set(hCam, 'ButtonDownFcn', @(src,evt)pickTarget(axCam));
+
+% For picking, store detections in appdata each frame
+setappdata(hCam,'detections',[]);
+setappdata(hCam,'selectedIdx',[]);
+
+%% -------------------- Main Simulation Loop --------------------
+for k = 1:numel(time)
+    t = time(k); 
+    
+    % ---------------- Camera pose & transform ----------------
+    camPosW = dronePos + camOffset;    % camera position in world
+    % Camera axes relative to world:
+    %   x_cam = +X_world (right), y_cam = +Y_world (down), z_cam = -Z_world (forward/down)
+    R_wc = [ 1 0  0;   % world -> cam rotation (applied to (Pw - C))
+             0 1  0;
+             0 0 -1];
+    
+    % ---------------- Render camera frame by projection ----------------
+    camImg = zeros(imgHeight,imgWidth,3,'uint8');  % dark background
+    
+    detections = [];  % [u v r_pixels idx]
+    for i = 1:nObj
+        Pw = objsW(i,:).';                % world point (center)
+        Pc = R_wc * (Pw - camPosW.');     % camera coords
+        Zc = Pc(3);  % forward distance along optical axis (downwards)
+        if Zc <= 0
+            continue; % object is above or at camera plane -> not visible
+        end
+        % Pinhole projection
+        u = fx * (Pc(1)/Zc) + cx;
+        v = fy * (Pc(2)/Zc) + cy;
+        % On image?
+        if u>=1 && u<=imgWidth && v>=1 && v<=imgHeight
+            % Apparent radius in pixels based on true radius and depth
+            r_px = max(2, round(fx * (objRadius_m / Zc)));
+            camImg = insertShape(camImg,'FilledCircle',[u v r_px], ...
+                                  'Color',[255 235 0],'Opacity',1); % yellow
+            camImg = insertShape(camImg,'Circle',[u v r_px], ...
+                                  'Color','black','LineWidth',2);
+            detections = [detections; u v r_px i Zc]; %#ok<AGROW>
+
+            % Bounding box (approximate square around circle)
+            boxSize = r_px * 2; % diameter
+            x1 = u - r_px; 
+            y1 = v - r_px;
+            
+            % Add slight "sketchy" noise (±3 px jitter each frame)
+            jitter = 3;
+            x1 = x1 + randi([-jitter jitter]);
+            y1 = y1 + randi([-jitter jitter]);
+            boxSize = boxSize + randi([-jitter jitter]);
+            
+            % Draw rectangle (sketchy detection box)
+            camImg = insertShape(camImg,'Rectangle',[x1 y1 boxSize boxSize], ...
+                                 'Color',[0 255 255],'LineWidth',2,'Opacity',0.6);
+
+        end
+    end
+        if takeoffDone && ~selectionMade && ~isempty(detections)
+        % Auto-select the closest detection (smallest Zc)
+        [~,idx] = min(detections(:,5));  % detections(:,5) = Zc depth
+        selectedIdx   = detections(idx,4);
+        selectionMade = true;
+        setappdata(hCam,'selectedIdx',selectedIdx);
+        fprintf('Auto-selected Obj %d for tracking.\n', selectedIdx);
+    end
+
+    % Save detections for click handler
+    setappdata(hCam,'detections',detections);
+    
+    % Draw crosshair at center
+    camImg = insertShape(camImg,'Line',[cx-20 cy cx+20 cy],'Color',[0 255 0],'LineWidth',2);
+    camImg = insertShape(camImg,'Line',[cx cy-20 cx cy+20],'Color',[0 255 0],'LineWidth',2);
+    
+    % If a selection exists, highlight it
+    selIdx = getappdata(hCam,'selectedIdx');
+    if ~isempty(selIdx) && ~isempty(detections)
+        % find the row for that world object index
+        row = find(detections(:,4)==selIdx,1);
+        if ~isempty(row)
+            u = detections(row,1); v = detections(row,2); r = detections(row,3);
+            camImg = insertShape(camImg,'Circle',[u v r+6],'Color',[0 255 0],'LineWidth',3);
+            selectionMade = true;
+            selectedIdx   = selIdx;
+        end
+    end
+    
+    % Update camera image
+    set(hCam,'CData',camImg);
+    for i = 1:size(detections,1)
+    u = detections(i,1); v = detections(i,2);
+    camImg = insertText(camImg,[u+10 v],sprintf('Obj %d',detections(i,4)), ...
+                        'FontSize',14,'BoxOpacity',0.6,'TextColor','black','BoxColor','yellow');
+    end
+    % ---------------- Takeoff phase ----------------
+    if ~takeoffDone
+        if dronePos(3) < takeoffAlt
+            % Climb straight up
+            climbVel = min(takeoffRate, takeoffAlt - dronePos(3));
+            droneVel = [0, 0, climbVel];
+            dronePos = dronePos + droneVel*dt;
+        else
+            % Reached altitude -> stop vertical motion
+            droneVel = [0, 0, 0];
+            takeoffDone = true;
+            fprintf('Takeoff complete. Holding at %.1f m altitude.\n', dronePos(3));
+        end
+    end
+
+    % ---------------- Control (only if we have a selected target) ----------------
+    if selectionMade && ~isempty(selectedIdx)
+        % Recompute the selected target camera geometry for control
+        Pw = objsW(selectedIdx,:).';
+        Pc = R_wc * (Pw - camPosW.');
+        Zc = Pc(3); % depth (down)
+        u  = fx * (Pc(1)/Zc) + cx;
+        v  = fy * (Pc(2)/Zc) + cy;
+        
+        % Pixel -> metric lateral offsets in camera frame (right & down)
+        x_cam = (u - cx) * Zc / fx;   % meters (right)
+        y_cam = (v - cy) * Zc / fy;   % meters (down)
+        
+        % Camera axes align with world X(right), Y(down). Zc = C_z - Pw_z (>0).
+        % Error we want to drive to zero (world frame):
+        %   world X error = -x_cam  (so target moves toward image center)
+        %   world Y error = -y_cam
+        %   world Z error = (Pw_z - drone_z)  (descend to object height)
+        hoverAlt = 0.5;  % hover 0.5 m above object
+        targetZ  = Pw(3) + hoverAlt;
+        
+        % Errors (drive to zero)    
+        errW = [x_cam, ...
+                y_cam, ...
+                (targetZ - dronePos(3))];
+        
+        % PID
+        % Split XY vs Z
+        err_xy = errW(1:2);
+        err_z  = errW(3);
+        
+        intErr(1:2) = intErr(1:2) + err_xy*dt;
+        intErr(3)   = intErr(3)   + err_z*dt;
+        
+        derErr = (errW - prevErr)/dt;
+        prevErr = errW;
+        
+        u_cmd(1:2) = Kp_xy*err_xy + Ki_xy*intErr(1:2) + Kd_xy*derErr(1:2);
+        u_cmd(3)   = Kp_z*err_z   + Ki_z*intErr(3)     + Kd_z*derErr(3);
+        
+        % Limit velocities
+        u_cmd(1:2) = max(min(u_cmd(1:2),vmax_xy),-vmax_xy);
+        u_cmd(3)   = max(min(u_cmd(3),vmax_z), -vmax_z);
+
+        
+        % Limit velocities
+        u_cmd(1:2) = max(min(u_cmd(1:2),vmax_xy),-vmax_xy);
+        u_cmd(3)   = max(min(u_cmd(3),vmax_z), -vmax_z);
+        
+        % Integrate state
+        droneVel = u_cmd;
+        dronePos = dronePos + droneVel*dt;
+        
+        % Console readout with units
+        dist_xy = hypot(x_cam, y_cam);
+        fprintf(['PID_X: %6.3f m/s | PID_Y: %6.3f m/s | PID_Z: %6.3f m/s  ||  ', ...
+                 'OffsetX: %6.3f m | OffsetY: %6.3f m | Zc (down): %6.3f m  ||  ', ...
+                 'Pos: [%.2f %.2f %.2f] m\n'], ...
+                 u_cmd(1), u_cmd(2), u_cmd(3), x_cam, y_cam, Zc, dronePos(1),dronePos(2),dronePos(3));
+        
+        % Draw a yellow line in camera from center to target
+        camImg = insertShape(camImg,'Line',[cx cy u v],'Color',[255 255 0],'LineWidth',2);
+        set(hCam,'CData',camImg);
+    end
+    
+    % ---------------- 3D Visualization Update ----------------
+    updateBox(hDrone, dronePos, boxDim);
+    traj = [traj; dronePos]; %#ok<AGROW>
+    set(trajPlot,'XData',traj(:,1),'YData',traj(:,2),'ZData',traj(:,3));
+    
+    drawnow;
+    
+    % Quit with Q
+    if ~ishandle(fig), break; end
+    ch = get(fig,'CurrentCharacter');
+    if ~isempty(ch) && (ch=='q' || ch=='Q')
+        set(fig,'CurrentCharacter',char(0));
+        break;
+    end
+end
+
+disp('Done.');
+
+%% -------------------- Click Handler (select target by clicking) -----------------
+function pickTarget(axCam)
+    % Called when the user clicks the camera image.
+    hIm = findobj(axCam,'Type','image');
+    if isempty(hIm), return; end
+    dets = getappdata(hIm,'detections'); % columns: [u v r idx Zc]
+    if isempty(dets), return; end
+    % Get click location in axes coordinates
+    cp = get(axCam,'CurrentPoint');  % [x y] in image coords
+    ux = cp(1,1); vy = cp(1,2);
+    % Choose nearest detection center
+    [~,ii] = min(hypot(dets(:,1)-ux, dets(:,2)-vy));
+    chosenIdx = dets(ii,4);    % world object index
+    setappdata(hIm,'selectedIdx',chosenIdx);
+end
+
+%% -------------------- Helpers: draw/update geometry --------------------
+function h = drawBox(ax, pos, dims, color)
+    % Axis-aligned box centered at pos
+    dx = dims(1); dy = dims(2); dz = dims(3);
+    [X,Y,Z] = ndgrid([-dx/2 dx/2],[-dy/2 dy/2],[-dz/2 dz/2]);
+    pts = [X(:),Y(:),Z(:)] + pos;
+    K = convhull(pts(:,1),pts(:,2),pts(:,3));
+    h = patch(ax,'Vertices',pts,'Faces',K,'FaceColor',color, ...
+              'EdgeColor',[0.1 0.2 0.3],'FaceAlpha',0.9);
+end
+
+function updateBox(h,pos,dims)
+    dx = dims(1); dy = dims(2); dz = dims(3);
+    [X,Y,Z] = ndgrid([-dx/2 dx/2],[-dy/2 dy/2],[-dz/2 dz/2]);
+    pts = [X(:),Y(:),Z(:)] + pos;
+    h.Vertices = pts;
+end
+
+function h = drawDisk3D(ax, center, radius, color)
+    th = linspace(0,2*pi,60);
+    x = center(1) + radius*cos(th);
+    y = center(2) + radius*sin(th);
+    z = center(3) + zeros(size(th));
+    h = fill3(ax,x,y,z,color,'EdgeColor','none','FaceAlpha',1);
+end

@@ -1,0 +1,79 @@
+#VRML V2.0 utf8
+
+# Simple UAV scene for MATLAB Simulink 3D Animation
+
+WorldInfo {
+  title "UAV Scene"
+  info [ "Simple VRML scene with drone and target" ]
+}
+
+# Viewpoint
+Viewpoint {
+  description "Main View"
+  position 0 5 20
+  orientation 1 0 0 -0.25
+}
+
+# Light source
+DirectionalLight {
+  direction -0.5 -1 -0.5
+  intensity 1
+}
+
+# Ground
+Transform {
+  translation 0 -1 0
+  children [
+    Shape {
+      geometry Box { size 50 0.1 50 }
+      appearance Appearance {
+        material Material {
+          diffuseColor 0.3 0.8 0.3
+        }
+      }
+    }
+  ]
+}
+
+# Drone body
+Transform {
+  translation 0 0 0
+  children [
+    Shape {
+      geometry Box { size 1 0.3 1 }
+      appearance Appearance {
+        material Material {
+          diffuseColor 0.2 0.2 0.8
+        }
+      }
+    }
+    Transform {
+      translation 0 0.3 0
+      children [
+        Shape {
+          geometry Cylinder { radius 0.15 height 0.1 }
+          appearance Appearance {
+            material Material {
+              diffuseColor 0.8 0.8 0.8
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+
+# Target sphere
+Transform {
+  translation 5 0 5
+  children [
+    Shape {
+      geometry Sphere { radius 0.5 }
+      appearance Appearance {
+        material Material {
+          diffuseColor 0.8 0.2 0.2
+        }
+      }
+    }
+  ]
+}
