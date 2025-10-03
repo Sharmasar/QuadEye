@@ -1,55 +1,70 @@
 # QuadEye
-# AutoTrack-Quadcopter 
+QuadEye is a MATLAB/Simulink project that simulates a fully autonomous drone equipped with a downward-facing camera. The system integrates object detection, coordinate transformation, and closed-loop control to demonstrate how a quadcopter can independently identify and track targets in its environment.
 
-AutoTrack-Quadcopter is a MATLAB/Simulink project that simulates an autonomous drone with a downward-facing camera. The drone detects objects in its environment, converts detections into inertial frames, and uses PID control to navigate toward a selected target.  
+The drone’s camera detects objects on the ground, and these detections are converted from the camera frame to the inertial (world) frame using transformation logic. A set of PID controllers then govern altitude, yaw, pitch, and roll, ensuring smooth and stable navigation toward the detected target.
 
-This project integrates **Simulink 3D Animation**, **Computer Vision Toolbox**, and a physics-based quadcopter model to create a realistic control and vision pipeline.  
+This project leverages Simulink 3D Animation for visualization, the Computer Vision Toolbox for processing camera data, and a detailed quadcopter dynamics model to simulate realistic flight behavior. Together, these components create an end-to-end autonomous tracking pipeline that is both educational and a foundation for advanced UAV research.
 
 ---
 
 ##  Features
-- Physics-based quadcopter dynamics simulation.  
-- Downward-facing virtual camera attached to the drone.  
-- Object detection via shape/color segmentation.  
-- Manual selection of target object in the camera feed.  
-- PID controllers for roll, pitch, yaw, and altitude control.  
-- Conversion of detections from camera frame → world frame.  
-- Drone autonomously navigates to target object.  
+- Quadcopter simulation in Simulink using physics-based dynamics.
+- Downward-facing virtual camera linked to the drone body.
+- Object detection via shape/color detection (simple CV pipeline).
+- Manual object selection for tracking.
+- PID controllers for roll, pitch, yaw, and altitude.
+- Conversion between camera frame and world (inertial) frame.
+- Autonomous navigation toward selected target.
 
 ---
 
 ##  Dependencies
-- MATLAB **R2025a**  
-- Simulink  
-- Simscape Multibody  
-- Simulink 3D Animation  
-- Computer Vision Toolbox  
-- Control System Toolbox  
-- [Quadcopter Drone Model in Simscape](https://www.mathworks.com/matlabcentral/fileexchange/63580-quadcopter-drone-model-in-simscape)  
+
+To run this project, you need:
+
+- **MATLAB R2025a** (tested version)  
+- **Simulink**  
+- **Simscape Multibody**  
+- **Simulink 3D Animation**  
+- **Computer Vision Toolbox**  
+- **Control System Toolbox**  
+- [Quadcopter Drone Model (Simscape)](https://www.mathworks.com/matlabcentral/fileexchange/63580-quadcopter-drone-model-in-simscape)  
 
 ---
 
 ##  Project Structure
-- `/models` → Main Simulink models  
-- `/scripts` → MATLAB functions for PID + detection logic  
-- `/archive` → Legacy prototypes & tests  
-- `README.md` → General project info  
-- `README_CODE.md` → Code-focused guide  
+
+- `/scripts` → MATLAB functions for camera, detection, and PID logic  
+- `/models` → Simulink models, including modified Maneuver Controller  
+- `/archive` → All earlier versions and prototypes  
+- `README.md` → Project documentation  
+
+---
+
+##  Getting Started
+
+1. Install all dependencies (see above).  
+2. Download and add the **Quadcopter Drone Model in Simscape** to your MATLAB path.  
+3. Open the main project model:  
+
+4. Run the simulation.  
+5. In the visualization window, select an object detected by the drone’s camera.  
+6. The quadcopter will use PID control to adjust roll, pitch, yaw, and thrust to move toward the object while stabilizing.
 
 ---
 
 ##  Notes
-- This is a **simulation-only project** (not tested on real hardware).  
-- Object detection currently uses simple shape/color detection; YOLO integration can be added later.  
-- All PID control loops are tunable from within Simulink.  
+- This is a **simulation-only project** (no hardware in the loop).  
+- Object detection is based on simple shape/color segmentation for virtual environments.  
+- YOLO/Deep Learning can be integrated later, but for now a lightweight pipeline is used to ensure simulation speed.  
 
 ---
 
 ##  License
-Released under the MIT License. Free to fork, modify, and contribute.  
+This project is released under the MIT License. Feel free to fork, modify, and build upon it.  
 
 ---
 
 ##  Acknowledgments
-- MathWorks Simscape Quadcopter Drone Model  
-- MATLAB & Simulink Toolboxes  
+- [MathWorks Quadcopter Drone Model](https://www.mathworks.com/matlabcentral/fileexchange/63580-quadcopter-drone-model-in-simscape)  
+- MATLAB and Simulink Toolboxes used for modeling, simulation, and visualization.  
